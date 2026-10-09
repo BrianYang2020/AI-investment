@@ -9,9 +9,57 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 import numpy as np
 import re
+import hmac
 
 # 設置頁面配置
 st.set_page_config(page_title="AI 分析台股基本面應用", layout="wide")
+
+def check_password():
+    """
+    登入密碼驗證
+
+    密碼存放於 Streamlit Secrets 的 APP_PASSWORD：
+    - 本機：寫在 .streamlit/secrets.toml（勿上傳 GitHub）
+    - Streamlit Cloud：App settings → Secrets
+
+    Returns:
+        bool: 是否已通過驗證
+    """
+    # 已登入則直接通過
+    if st.session_state.get("authenticated"):
+        return True
+
+    # 讀取設定的密碼；未設定時一律拒絕進入，避免網頁在沒有保護的情況下公開
+    try:
+        app_password = str(st.secrets["APP_PASSWORD"])
+    except Exception:
+        app_password = ""
+
+    st.header("🔒 【Code Gym】AI 分析台股基本面應用", divider="rainbow")
+
+    if not app_password:
+        st.error("尚未設定登入密碼。請在 .streamlit/secrets.toml（本機）或 Streamlit Cloud 的 Secrets 中加入：APP_PASSWORD = \"您的密碼\"")
+        return False
+
+    # 使用表單，按 Enter 即可送出
+    with st.form("login_form"):
+        password = st.text_input("請輸入登入密碼", type="password")
+        submitted = st.form_submit_button("登入", type="primary")
+
+    if submitted:
+        # 使用 hmac.compare_digest 比對，避免時間差攻擊
+        if hmac.compare_digest(password.encode("utf-8"), app_password.encode("utf-8")):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("密碼錯誤，請重新輸入。")
+
+    return False
+
+# 未通過密碼驗證則停止執行後續內容
+if not check_password():
+    st.stop()
+
 st.header("【Code Gym】AI 分析台股基本面應用", divider="rainbow")
 
 # 函數：格式化大數字
@@ -949,6 +997,11 @@ def create_zscore_gauge(zscore_result):
 def main():
     # 側邊欄
     st.sidebar.header("Code Gym", divider="rainbow")
+
+    # 登出按鈕
+    if st.sidebar.button("🚪 登出"):
+        st.session_state["authenticated"] = False
+        st.rerun()
     
     # 股票代碼輸入
     ticker = st.sidebar.text_input(
