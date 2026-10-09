@@ -20,6 +20,11 @@ st.set_page_config(
 st.title("📈 AI 股票趨勢分析系統")
 st.divider()
 
+# RSI 指標預設參數
+DEFAULT_RSI_PERIOD = 14       # RSI 計算天數
+DEFAULT_RSI_OVERBOUGHT = 70   # 超買門檻
+DEFAULT_RSI_OVERSOLD = 30     # 超賣門檻
+
 def get_stock_data(symbol, api_key, start_date, end_date):
     """
     從Financial Modeling Prep API獲取股票歷史數據
@@ -108,26 +113,102 @@ def get_moving_averages(df):
     df['MA10'] = df['close'].rolling(window=10, min_periods=1).mean()
     df['MA20'] = df['close'].rolling(window=20, min_periods=1).mean()
     df['MA60'] = df['close'].rolling(window=60, min_periods=1).mean()
-    
+
     return df
 
-def create_candlestick_chart(df, symbol):
+def calculate_rsi(df, period=DEFAULT_RSI_PERIOD):
     """
-    創建K線圖和移動平均線圖表
-    
+    計算RSI相對強弱指標
+
+    公式：RSI = 100 - (100 / (1 + RS))
+          RS  = N日平均漲幅 / N日平均跌幅（N 預設為 14）
+
     Args:
-        df: 包含股票數據和移動平均線的DataFrame
+        df: 股票數據DataFrame（需包含 close 欄位）
+        period: RSI計算天數，預設14天
+
+    Returns:
+        DataFrame: 新增 RSI 欄位的數據；前 period 筆因資料不足為 NaN
+    """
+    if df is None or len(df) == 0:
+        return None
+
+    # 參數檢查：計算天數至少需要 2 天
+    if not isinstance(period, (int, np.integer)) or period < 2:
+        raise ValueError(f"RSI計算天數必須為大於等於2的整數，目前為：{period}")
+
+    if 'close' not in df.columns:
+        raise ValueError("數據缺少收盤價（close）欄位，無法計算RSI")
+
+    df = df.copy()
+
+    # 每日收盤價變動，拆分為漲幅與跌幅（跌幅取正值）
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # N日平均漲幅與平均跌幅（資料不足 N 日時不計算）
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+
+    # 計算 RS 與 RSI，平均跌幅為 0 時避免除以零
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    # 特殊情況處理：
+    # - 期間內無任何跌幅 → RSI = 100
+    # - 期間內價格完全沒有變動 → RSI = 50（中性）
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
+    # 資料不足的前段維持 NaN
+    rsi = rsi.where(avg_gain.notna())
+
+    df['RSI'] = rsi
+
+    return df
+
+def get_rsi_status(rsi_value, overbought=DEFAULT_RSI_OVERBOUGHT, oversold=DEFAULT_RSI_OVERSOLD):
+    """
+    依據RSI數值判斷超買超賣狀態
+
+    Args:
+        rsi_value: RSI數值
+        overbought: 超買門檻（預設70）
+        oversold: 超賣門檻（預設30）
+
+    Returns:
+        str: 狀態說明（超買區 / 超賣區 / 中性區 / 資料不足）
+    """
+    if rsi_value is None or pd.isna(rsi_value):
+        return "資料不足"
+    if rsi_value > overbought:
+        return "超買區"
+    if rsi_value < oversold:
+        return "超賣區"
+    return "中性區"
+
+def create_candlestick_chart(df, symbol, rsi_period=DEFAULT_RSI_PERIOD,
+                             overbought=DEFAULT_RSI_OVERBOUGHT, oversold=DEFAULT_RSI_OVERSOLD):
+    """
+    創建K線圖、移動平均線、成交量與RSI圖表
+
+    Args:
+        df: 包含股票數據、移動平均線與RSI的DataFrame
         symbol: 股票代碼
-    
+        rsi_period: RSI計算天數（用於標題顯示）
+        overbought: RSI超買門檻
+        oversold: RSI超賣門檻
+
     Returns:
         plotly.graph_objects.Figure: 互動式圖表
     """
+    # 圖表分為上下區塊：上方K線與成交量，下方RSI走勢圖
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=3, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.03,
-        subplot_titles=('價格與移動平均線', '成交量'),
-        row_width=[0.2, 0.7]
+        vertical_spacing=0.04,
+        subplot_titles=('價格與移動平均線', '成交量', f'RSI 相對強弱指標（{rsi_period}日）'),
+        row_heights=[0.55, 0.15, 0.30]
     )
     
     # K線圖
@@ -176,13 +257,83 @@ def create_candlestick_chart(df, symbol):
         ),
         row=2, col=1
     )
-    
+
+    # RSI 線圖（藍色），滑鼠懸停顯示 RSI 數值
+    if 'RSI' in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df['date'],
+                y=df['RSI'],
+                mode='lines',
+                name=f'RSI({rsi_period})',
+                line=dict(color='blue', width=2),
+                hovertemplate='日期：%{x|%Y-%m-%d}<br>RSI：%{y:.2f}<extra></extra>'
+            ),
+            row=3, col=1
+        )
+
+        # 標記超買 / 超賣的交易日，作為視覺警告
+        overbought_points = df[df['RSI'] > overbought]
+        oversold_points = df[df['RSI'] < oversold]
+        if len(overbought_points) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=overbought_points['date'],
+                    y=overbought_points['RSI'],
+                    mode='markers',
+                    name='超買警告',
+                    marker=dict(color='red', size=6, symbol='triangle-up'),
+                    hovertemplate='日期：%{x|%Y-%m-%d}<br>RSI：%{y:.2f}（超買）<extra></extra>'
+                ),
+                row=3, col=1
+            )
+        if len(oversold_points) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=oversold_points['date'],
+                    y=oversold_points['RSI'],
+                    mode='markers',
+                    name='超賣警告',
+                    marker=dict(color='green', size=6, symbol='triangle-down'),
+                    hovertemplate='日期：%{x|%Y-%m-%d}<br>RSI：%{y:.2f}（超賣）<extra></extra>'
+                ),
+                row=3, col=1
+            )
+
+    # RSI 區塊：超買區紅色背景、超賣區綠色背景
+    # （需在加入RSI線之後才繪製，否則Plotly會略過空白子圖）
+    fig.add_hrect(
+        y0=overbought, y1=100,
+        fillcolor='red', opacity=0.1, line_width=0,
+        row=3, col=1
+    )
+    fig.add_hrect(
+        y0=0, y1=oversold,
+        fillcolor='green', opacity=0.1, line_width=0,
+        row=3, col=1
+    )
+
+    # 超買 / 超賣門檻：紅色虛線
+    fig.add_hline(
+        y=overbought, line_dash='dash', line_color='red',
+        annotation_text=f'超買 {overbought}', annotation_position='top left',
+        row=3, col=1
+    )
+    fig.add_hline(
+        y=oversold, line_dash='dash', line_color='red',
+        annotation_text=f'超賣 {oversold}', annotation_position='bottom left',
+        row=3, col=1
+    )
+
+    # 圖表標題顯示股票代碼與分析期間
+    period_text = ''
+    if len(df) > 0:
+        period_text = f"（{df['date'].iloc[0].strftime('%Y-%m-%d')} 至 {df['date'].iloc[-1].strftime('%Y-%m-%d')}）"
+
     # 更新佈局
     fig.update_layout(
-        title=f'{symbol} 股價技術分析圖表',
-        xaxis_title='日期',
-        yaxis_title='價格 (USD)',
-        height=700,
+        title=f'{symbol} 股價技術分析圖表{period_text}',
+        height=900,
         showlegend=True,
         legend=dict(
             orientation="h",
@@ -200,37 +351,57 @@ def create_candlestick_chart(df, symbol):
         row=1, col=1
     )
     
-    # 更新y軸
+    fig.update_xaxes(title_text="日期", row=3, col=1)
+
+    # 更新y軸（RSI 固定 0~100）
     fig.update_yaxes(title_text="價格 (USD)", row=1, col=1)
     fig.update_yaxes(title_text="成交量", row=2, col=1)
-    
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+
     return fig
 
-def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date):
+def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date,
+                         rsi_period=DEFAULT_RSI_PERIOD,
+                         overbought=DEFAULT_RSI_OVERBOUGHT, oversold=DEFAULT_RSI_OVERSOLD):
     """
-    使用OpenAI進行技術分析
-    
+    使用OpenAI進行技術分析（含RSI分析）
+
     Args:
         symbol: 股票代碼
-        stock_data: 股票數據DataFrame
+        stock_data: 股票數據DataFrame（含移動平均線與RSI）
         openai_api_key: OpenAI API金鑰
         start_date: 起始日期
         end_date: 結束日期
-    
+        rsi_period: RSI計算天數
+        overbought: RSI超買門檻
+        oversold: RSI超賣門檻
+
     Returns:
         str: AI分析結果
     """
     try:
         # 創建OpenAI客戶端
         client = OpenAI(api_key=openai_api_key)
-        
+
         # 準備數據
         first_date = stock_data['date'].iloc[0].strftime('%Y-%m-%d')
         last_date = stock_data['date'].iloc[-1].strftime('%Y-%m-%d')
         start_price = stock_data['close'].iloc[0]
         end_price = stock_data['close'].iloc[-1]
         price_change = ((end_price - start_price) / start_price) * 100
-        
+
+        # 準備RSI摘要資訊
+        rsi_series = stock_data['RSI'].dropna() if 'RSI' in stock_data.columns else pd.Series(dtype=float)
+        if len(rsi_series) > 0:
+            latest_rsi = rsi_series.iloc[-1]
+            rsi_summary = f"""- RSI 參數：{rsi_period} 日，超買門檻 {overbought}，超賣門檻 {oversold}
+- 當前RSI值：{latest_rsi:.2f}（狀態：{get_rsi_status(latest_rsi, overbought, oversold)}）
+- 期間RSI最高值：{rsi_series.max():.2f}，最低值：{rsi_series.min():.2f}，平均值：{rsi_series.mean():.2f}
+- 期間處於超買區（RSI>{overbought}）天數：{int((rsi_series > overbought).sum())} 天
+- 期間處於超賣區（RSI<{oversold}）天數：{int((rsi_series < oversold).sum())} 天"""
+        else:
+            rsi_summary = f"- RSI 參數：{rsi_period} 日（期間資料不足，無法計算RSI）"
+
         # 轉換數據為JSON格式
         data_json = stock_data.to_json(orient='records', date_format='iso')
         
@@ -267,8 +438,11 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 分析期間：{first_date} 至 {last_date}
 - 期間價格變化：{price_change:.2f}% (從 ${start_price:.2f} 變化到 ${end_price:.2f})
 
+### RSI 指標摘要
+{rsi_summary}
+
 ### 完整交易數據
-以下是該期間的完整交易數據，包含日期、開盤價、最高價、最低價、收盤價、成交量和移動平均線：
+以下是該期間的完整交易數據，包含日期、開盤價、最高價、最低價、收盤價、成交量、移動平均線和RSI：
 {data_json}
 
 ### 分析架構：技術面完整分析
@@ -299,8 +473,15 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 關鍵價位觀察點
 - 技術面風險因子
 
+#### 6. RSI分析
+- 當前RSI值與狀態判斷（超買區 / 超賣區 / 中性區）
+- RSI指標解讀：期間RSI走勢與歷史區間分布
+- 超買超賣狀態解讀：歷史上RSI進入超買（>{overbought}）或超賣（<{oversold}）區時，後續價格曾出現的現象
+- 動量分析：RSI走勢反映的價格動能強弱變化，以及RSI與價格之間是否出現背離現象
+
 ### 綜合評估要求
 #### 輸出格式要求
+- 必須包含獨立的「RSI分析」章節，且章節開頭明確列出當前RSI值與狀態判斷
 - 條理清晰，分段論述
 - 提供具體的數據支撐
 - 避免過於絕對的預測，強調分析的局限性
@@ -315,7 +496,7 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=2000,
+            max_tokens=2500,
             temperature=0.3
         )
         
@@ -364,6 +545,35 @@ end_date = st.sidebar.date_input(
     help="選擇分析的結束日期"
 )
 
+# RSI 參數設定（支援自訂）
+st.sidebar.markdown("#### 📉 RSI 參數設定")
+rsi_period = st.sidebar.number_input(
+    "RSI 計算天數",
+    min_value=2,
+    max_value=60,
+    value=DEFAULT_RSI_PERIOD,
+    step=1,
+    help="RSI 計算所使用的天數，預設為 14 日"
+)
+
+rsi_overbought = st.sidebar.number_input(
+    "超買門檻",
+    min_value=50,
+    max_value=95,
+    value=DEFAULT_RSI_OVERBOUGHT,
+    step=1,
+    help="RSI 高於此值視為超買，預設為 70"
+)
+
+rsi_oversold = st.sidebar.number_input(
+    "超賣門檻",
+    min_value=5,
+    max_value=50,
+    value=DEFAULT_RSI_OVERSOLD,
+    step=1,
+    help="RSI 低於此值視為超賣，預設為 30"
+)
+
 # 分析按鈕
 analyze_button = st.sidebar.button("🚀 開始分析", type="primary")
 
@@ -387,28 +597,83 @@ if analyze_button:
         st.error("請輸入OpenAI API Key")
     elif start_date >= end_date:
         st.error("起始日期不能晚於或等於結束日期")
+    elif rsi_oversold >= rsi_overbought:
+        st.error("RSI 超賣門檻必須小於超買門檻")
     else:
         # 開始分析流程
         with st.spinner("正在獲取股票數據..."):
+            # 往前多抓一段暖身資料，讓MA60與RSI在分析起始日即有完整數值
+            warmup_days = int(max(60, rsi_period) * 1.6) + 10
+            fetch_start_date = start_date - timedelta(days=warmup_days)
+
             # 獲取股票數據
-            stock_data = get_stock_data(symbol.upper(), fmp_api_key, start_date, end_date)
-            
+            stock_data = get_stock_data(symbol.upper(), fmp_api_key, fetch_start_date, end_date)
+
             if stock_data is not None and len(stock_data) > 0:
-                st.success(f"成功獲取 {len(stock_data)} 筆交易數據")
-                
-                # 過濾數據
-                filtered_data = filter_by_date_range(stock_data, start_date, end_date)
-                
-                if filtered_data is not None and len(filtered_data) > 0:
-                    # 計算移動平均線
-                    with st.spinner("正在計算技術指標..."):
-                        data_with_ma = get_moving_averages(filtered_data)
-                    
+                # 先以完整數據計算技術指標，再過濾至使用者選擇的日期範圍
+                data_with_ma = None
+                with st.spinner("正在計算技術指標..."):
+                    try:
+                        full_data = get_moving_averages(stock_data)
+                        full_data = calculate_rsi(full_data, int(rsi_period))
+                        data_with_ma = filter_by_date_range(full_data, start_date, end_date)
+                    except Exception as e:
+                        st.error(f"技術指標計算失敗：{str(e)}")
+
+                if data_with_ma is not None and len(data_with_ma) > 0:
+                    st.success(f"成功獲取 {len(data_with_ma)} 筆交易數據")
+
+                    if data_with_ma['RSI'].isna().all():
+                        st.warning(f"可用交易數據不足 {int(rsi_period) + 1} 筆，無法計算 RSI，請拉長日期範圍或縮短 RSI 計算天數。")
+
                     if data_with_ma is not None:
                         # 顯示K線圖
                         st.markdown("### 📊 股價K線圖與技術指標")
-                        chart = create_candlestick_chart(data_with_ma, symbol.upper())
+                        chart = create_candlestick_chart(
+                            data_with_ma,
+                            symbol.upper(),
+                            rsi_period=int(rsi_period),
+                            overbought=rsi_overbought,
+                            oversold=rsi_oversold
+                        )
                         st.plotly_chart(chart, use_container_width=True)
+
+                        # RSI 超買超賣狀態
+                        st.markdown("### 📉 RSI 相對強弱指標")
+                        rsi_valid = data_with_ma['RSI'].dropna()
+                        if len(rsi_valid) > 0:
+                            latest_rsi = rsi_valid.iloc[-1]
+                            rsi_status = get_rsi_status(latest_rsi, rsi_overbought, rsi_oversold)
+
+                            rsi_col1, rsi_col2, rsi_col3 = st.columns(3)
+                            with rsi_col1:
+                                st.metric(
+                                    f"當前 RSI（{int(rsi_period)}日）",
+                                    f"{latest_rsi:.2f}",
+                                    help="分析期間最後一個交易日的 RSI 數值"
+                                )
+                            with rsi_col2:
+                                st.metric(
+                                    "超買天數",
+                                    f"{int((rsi_valid > rsi_overbought).sum())} 天",
+                                    help=f"期間內 RSI 高於 {rsi_overbought} 的交易日數"
+                                )
+                            with rsi_col3:
+                                st.metric(
+                                    "超賣天數",
+                                    f"{int((rsi_valid < rsi_oversold).sum())} 天",
+                                    help=f"期間內 RSI 低於 {rsi_oversold} 的交易日數"
+                                )
+
+                            # 超買 / 超賣警告
+                            if rsi_status == "超買區":
+                                st.warning(f"⚠️ 超買警告：當前 RSI 為 {latest_rsi:.2f}，高於超買門檻 {rsi_overbought}。技術指標反映價格短期漲幅較大。")
+                            elif rsi_status == "超賣區":
+                                st.warning(f"⚠️ 超賣警告：當前 RSI 為 {latest_rsi:.2f}，低於超賣門檻 {rsi_oversold}。技術指標反映價格短期跌幅較大。")
+                            else:
+                                st.info(f"當前 RSI 為 {latest_rsi:.2f}，位於中性區（{rsi_oversold} ~ {rsi_overbought}）。")
+                        else:
+                            st.info("RSI 資料不足，暫無法判斷超買超賣狀態。")
                         
                         # 基本統計資訊
                         st.markdown("### 📈 基本統計資訊")
@@ -447,9 +712,12 @@ if analyze_button:
                             ai_analysis = generate_ai_insights(
                                 symbol.upper(), 
                                 data_with_ma, 
-                                openai_api_key, 
-                                start_date, 
-                                end_date
+                                openai_api_key,
+                                start_date,
+                                end_date,
+                                rsi_period=int(rsi_period),
+                                overbought=rsi_overbought,
+                                oversold=rsi_oversold
                             )
                         
                         if ai_analysis:
@@ -462,11 +730,11 @@ if analyze_button:
                         display_data = display_data.sort_values('date', ascending=False)
                         
                         # 格式化數據
-                        display_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'MA5', 'MA10', 'MA20', 'MA60']
+                        display_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'MA5', 'MA10', 'MA20', 'MA60', 'RSI']
                         display_data_formatted = display_data[display_columns].copy()
-                        
+
                         # 重命名欄位
-                        display_data_formatted.columns = ['日期', '開盤', '最高', '最低', '收盤', '成交量', 'MA5', 'MA10', 'MA20', 'MA60']
+                        display_data_formatted.columns = ['日期', '開盤', '最高', '最低', '收盤', '成交量', 'MA5', 'MA10', 'MA20', 'MA60', f'RSI({int(rsi_period)})']
                         
                         st.dataframe(
                             display_data_formatted,
@@ -476,7 +744,7 @@ if analyze_button:
                         
                         st.success("✅ 分析完成！")
                         
-                else:
+                elif data_with_ma is not None:
                     st.warning("所選日期範圍內沒有交易數據，請調整日期範圍。")
             else:
                 st.error("無法獲取股票數據，請檢查股票代碼和API金鑰。")
@@ -503,7 +771,8 @@ if not analyze_button:
     - **MA10**: 10日移動平均線，短中期趨勢指標  
     - **MA20**: 20日移動平均線，中期趨勢指標
     - **MA60**: 60日移動平均線，長期趨勢指標
-    
+    - **RSI**: 相對強弱指標（預設14日），RSI = 100 - 100 / (1 + RS)，RS = 平均漲幅 / 平均跌幅；高於70為超買區、低於30為超賣區（門檻可於側邊欄自訂）
+
     ### 🔑 API金鑰獲取
     - **FMP API**: 前往 [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs) 註冊
     - **OpenAI API**: 前往 [OpenAI Platform](https://platform.openai.com) 註冊
