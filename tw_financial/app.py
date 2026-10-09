@@ -1046,53 +1046,71 @@ def analyze_with_openai(annual_views, fscore_result, zscore_result, dupont_resul
 # 主應用程式
 # =====================================================================
 
-def show_basic_info(ticker, stock_info_data, key_metrics_data, price_data, annual_views):
-    """三欄式公司基本資訊：公司與產業 / 最新收盤價 / 估算市值與本益比"""
-
+def compute_basic_info(ticker, stock_info_data, key_metrics_data, price_data, annual_views):
+    """整理公司基本資訊：公司與產業 / 最新收盤價 / 估算市值與本益比"""
+    
     if stock_info_data:
         company_name = stock_info_data[0].get('stock_name', ticker)
         industries = list(dict.fromkeys(item.get('industry_category', '') for item in stock_info_data if item.get('industry_category')))
         market = {'twse': '上市', 'tpex': '上櫃', 'emerging': '興櫃'}.get(stock_info_data[0].get('type'), 'N/A')
     else:
         company_name, industries, market = ticker, [], 'N/A'
-
-    # FinMind 資料依日期升冪排列，最新一筆在最後
-    latest_metrics = max(key_metrics_data, key=lambda x: x['date']) if key_metrics_data else {}
+    
+    info = {
+        'company_name': company_name,
+        'industries': industries,
+        'market': market,
+        'close_text': 'N/A',
+        'close_delta': None,
+        'price_date_text': '',
+        'market_cap_text': 'N/A',
+        'per_text': 'N/A',
+        'metrics_date_text': '',
+    }
+    
+    # 最新收盤價與漲跌（FinMind 資料依日期升冪排列，最新一筆在最後）
     prices = sorted(price_data, key=lambda x: x['date'])
+    if prices and prices[-1].get('close'):
+        latest_close = prices[-1]['close']
+        info['close_text'] = f"{latest_close:,.2f} 元"
+        info['price_date_text'] = f"資料日期：{prices[-1]['date']}"
+        if len(prices) >= 2 and prices[-2].get('close'):
+            change = latest_close - prices[-2]['close']
+            info['close_delta'] = f"{change:+.2f}（{change / prices[-2]['close']:+.2%}）"
+    
+    # 估算市值 = 最新 PBR × 最新一季歸屬母公司權益
+    latest_metrics = max(key_metrics_data, key=lambda x: x['date']) if key_metrics_data else {}
+    if latest_metrics.get('PBR') and annual_views:
+        equity = annual_views[0]['equity_parent'] or annual_views[0]['stockholdersequity']
+        if not is_missing(equity):
+            info['market_cap_text'] = format_large_number(latest_metrics['PBR'] * equity)
+    if latest_metrics.get('PER'):
+        info['per_text'] = f"{latest_metrics['PER']:.2f}"
+    if latest_metrics:
+        info['metrics_date_text'] = f"資料日期：{latest_metrics.get('date')}"
+    
+    return info
 
+def show_basic_info(ticker, info):
+    """三欄式公司基本資訊"""
     col1, col2, col3 = st.columns(3)
-
+    
     with col1:
-        st.subheader(f"{company_name} ({ticker})")
-        st.write(f"**產業類別:** {'、'.join(industries) if industries else 'N/A'}")
-        st.write(f"**市場別:** {market}")
-
+        st.subheader(f"{info['company_name']} ({ticker})")
+        st.write(f"**產業類別:** {'、'.join(info['industries']) if info['industries'] else 'N/A'}")
+        st.write(f"**市場別:** {info['market']}")
+    
     with col2:
-        if prices:
-            latest_close = prices[-1].get('close')
-            delta = None
-            if len(prices) >= 2 and prices[-2].get('close'):
-                change = latest_close - prices[-2]['close']
-                delta = f"{change:+.2f}（{change / prices[-2]['close']:+.2%}）"
-            st.metric("最新收盤價", f"{latest_close:,.2f} 元", delta=delta)
-            st.caption(f"資料日期：{prices[-1]['date']}")
-        else:
-            st.metric("最新收盤價", "N/A")
-
+        st.metric("最新收盤價", info['close_text'], delta=info['close_delta'])
+        if info['price_date_text']:
+            st.caption(info['price_date_text'])
+    
     with col3:
-        # 估算市值 = 最新 PBR × 最新一季歸屬母公司權益
-        market_cap = None
-        if latest_metrics.get('PBR') and annual_views:
-            equity = annual_views[0]['equity_parent'] or annual_views[0]['stockholdersequity']
-            if not is_missing(equity):
-                market_cap = latest_metrics['PBR'] * equity
-        st.metric("估算市值", format_large_number(market_cap))
-        per = latest_metrics.get('PER')
-        st.metric("本益比 (PER)", f"{per:.2f}" if per else "N/A")
-        if latest_metrics:
-            st.caption(f"市值＝PBR×歸屬母公司權益（估算）；資料日期：{latest_metrics.get('date')}")
+        st.metric("估算市值", info['market_cap_text'])
+        st.metric("本益比 (PER)", info['per_text'])
+        if info['metrics_date_text']:
+            st.caption(f"市值＝PBR×歸屬母公司權益（估算）；{info['metrics_date_text']}")
 
-    return company_name, industries, market
 
 def show_fourstage_analysis(quality_report, fscore_result, zscore_result, dupont_result, cashflow_result):
     """四階段財報分析頁籤"""
@@ -1239,42 +1257,254 @@ def show_fourstage_analysis(quality_report, fscore_result, zscore_result, dupont
     else:
         st.warning("無法計算現金流分析")
 
+def build_summary_rows(fscore_result, zscore_result, dupont_result, cashflow_result):
+    """分析數據摘要（網頁與 PDF 共用）"""
+    summary_data = []
+    if fscore_result:
+        score = fscore_result['total_score']
+        summary_data.append({'分析項目': 'Piotroski F-Score', '結果': f"{score}/9",
+                             '狀態': '優秀' if score >= 7 else '良好' if score >= 5 else '需關注'})
+    if zscore_result:
+        z = zscore_result['z_score']
+        summary_data.append({'分析項目': 'Altman Z-Score', '結果': 'N/A' if z is None else f"{z:.2f}",
+                             '狀態': zscore_result['risk_level']})
+    if dupont_result['annual_data']:
+        roe = dupont_result['annual_data'][0]['direct_roe']
+        status = 'N/A' if roe is None else '優秀' if roe > 0.15 else '良好' if roe > 0.10 else '需關注'
+        summary_data.append({'分析項目': 'ROE (杜邦分析，近四季)', '結果': format_percent(roe), '狀態': status})
+    if cashflow_result:
+        summary_data.append({'分析項目': '現金流品質', '結果': format_ratio(cashflow_result['cf_quality_ratio'], 2),
+                             '狀態': cashflow_result['quality_assessment']})
+    return summary_data
+
+def run_analysis(ticker, finmind_api_token, openai_api_key, ai_model, start_date):
+    """
+    執行完整分析流程，回傳結果 dict（失敗時回傳 None）
+    結果會存入 session_state，按下「匯出 PDF」等按鈕重新整理頁面時不會遺失
+    """
+    is_valid, error_msg = validate_taiwan_stock_code(ticker)
+    if not is_valid:
+        st.error(error_msg)
+        return None
+    if not finmind_api_token:
+        st.warning("請輸入 FinMind API Token")
+        return None
+    
+    try:
+        # 取得與處理數據
+        with st.spinner(f"正在從 FinMind API 獲取 {ticker} 的財務報表資料..."):
+            raw_data = get_finmind_raw_data(ticker, finmind_api_token, start_date)
+            quarterly, conversion_notes = build_quarterly_data(raw_data)
+            annual_views = build_annual_views(quarterly, raw_data.get('key_metrics', []))
+        
+        stock_info_data = raw_data.get('stock_info', [])
+        is_financial = is_financial_industry(stock_info_data)
+        basic_info = compute_basic_info(ticker, stock_info_data, raw_data.get('key_metrics', []),
+                                        raw_data.get('stock_price', []), annual_views)
+        
+        # 展示用資料
+        income_df, balance_df, ratio_df, cash_df = build_display_tables(quarterly)
+        if income_df.empty:
+            st.error("無法獲取有效的財務數據")
+            return None
+        
+        # 四階段分析
+        quality_report = analyze_data_quality(quarterly, annual_views, conversion_notes, is_financial)
+        fscore_result = calculate_piotroski_fscore(annual_views)
+        zscore_result = calculate_altman_zscore(annual_views)
+        dupont_result = calculate_dupont_analysis(annual_views)
+        cashflow_result = calculate_cashflow_analysis(annual_views)
+        
+        # AI 分析
+        ai_analysis = None
+        if openai_api_key:
+            stock_info = {
+                'company_name': basic_info['company_name'],
+                'stock_code': ticker,
+                'industry': '、'.join(basic_info['industries']) if basic_info['industries'] else 'N/A',
+                'market': basic_info['market'],
+                'is_financial_industry': is_financial,
+            }
+            with st.spinner("正在使用AI進行四階段財務分析..."):
+                ai_analysis = analyze_with_openai(
+                    annual_views, fscore_result, zscore_result, dupont_result, cashflow_result,
+                    quality_report, stock_info, openai_api_key, ai_model
+                )
+        
+        return {
+            'ticker': ticker,
+            'company_name': basic_info['company_name'],
+            'industries': basic_info['industries'],
+            'market': basic_info['market'],
+            'basic_info': basic_info,
+            'is_financial': is_financial,
+            'quality_report': quality_report,
+            'fscore_result': fscore_result,
+            'zscore_result': zscore_result,
+            'dupont_result': dupont_result,
+            'cashflow_result': cashflow_result,
+            'summary_rows': build_summary_rows(fscore_result, zscore_result, dupont_result, cashflow_result),
+            'income_df': income_df,
+            'balance_df': balance_df,
+            'ratio_df': ratio_df,
+            'cash_df': cash_df,
+            'ai_analysis': ai_analysis,
+            'ai_model': ai_model,
+            'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        }
+    
+    except Exception as e:
+        st.error(f"分析過程中發生錯誤：{str(e)}")
+        st.info("請確認股票代碼與 FinMind API Token 是否正確，或稍後再試。")
+        # 詳細錯誤只寫入伺服器記錄（Streamlit Cloud 的 Manage app → Logs），不顯示在公開網頁上
+        print(traceback.format_exc())
+        return None
+
+def get_pdf_bytes(result):
+    """產生 PDF（同一份分析結果只產生一次）"""
+    if 'pdf_bytes' not in result:
+        try:
+            from pdf_report import generate_pdf_report
+        except ImportError:
+            result['pdf_bytes'] = None
+            result['pdf_error'] = "缺少 reportlab 套件，請執行 pip install reportlab 後重新啟動"
+            return None
+        
+        cashflow = result['cashflow_result']
+        report = dict(result)
+        if cashflow:
+            detail = cashflow['detailed_data']
+            report['cashflow_detail_rows'] = [
+                ('自由現金流', format_large_number(cashflow['free_cashflow'])),
+                ('營運現金流', format_large_number(detail['operating_cf'])),
+                ('投資現金流', format_large_number(detail['investing_cf'])),
+                ('融資現金流', format_large_number(detail['financing_cf'])),
+                ('淨利潤', format_large_number(detail['net_income'])),
+                ('資本支出', format_large_number(detail['capex'])),
+            ]
+        try:
+            result['pdf_bytes'] = generate_pdf_report(report)
+        except Exception as e:
+            result['pdf_bytes'] = None
+            result['pdf_error'] = f"PDF 產生失敗：{e}"
+            print(traceback.format_exc())
+    return result['pdf_bytes']
+
+def show_export_button(result):
+    """「匯出」按鈕：下載 PDF，存檔位置由瀏覽器詢問"""
+    with st.spinner("正在產生 PDF 報告..."):
+        pdf_bytes = get_pdf_bytes(result)
+    if pdf_bytes is None:
+        st.error(result.get('pdf_error', 'PDF 產生失敗'))
+        return
+    
+    file_name = f"{result['ticker']}_{result['company_name']}_財報分析_{datetime.now().strftime('%Y%m%d')}.pdf"
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        st.download_button(
+            "📄 匯出 PDF",
+            data=pdf_bytes,
+            file_name=file_name,
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+        )
+    with col2:
+        st.caption("💡 若希望每次下載時選擇存檔位置，請在瀏覽器設定中開啟「下載前詢問每個檔案的儲存位置」"
+                   "（Chrome／Edge：設定 → 下載；Safari：設定 → 一般 → 檔案下載位置選「每次都詢問」）。")
+
+def display_results(result):
+    """顯示分析結果（從 session_state 讀取，頁面重新整理時不需重新分析）"""
+    
+    show_basic_info(result['ticker'], result['basic_info'])
+    if result['is_financial']:
+        st.warning("⚠️ 此公司屬於金融保險業，財報結構與一般產業不同，F-Score 與 Z-Score 不適用，結果僅供參考。")
+    
+    show_export_button(result)
+    
+    income_df, balance_df, ratio_df, cash_df = result['income_df'], result['balance_df'], result['ratio_df'], result['cash_df']
+    charts = create_financial_charts(income_df, balance_df, cash_df)
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "損益表分析", "資產負債表分析", "現金流量表分析", "四階段財報分析", "AI分析"
+    ])
+    
+    with tab1:
+        st.subheader("損益表分析")
+        st.plotly_chart(charts['income'], use_container_width=True)
+        st.subheader("完整損益表（單季，單位：億元）")
+        st.dataframe(descending(income_df), use_container_width=True)
+    
+    with tab2:
+        st.subheader("資產負債表分析")
+        st.plotly_chart(charts['balance'], use_container_width=True)
+        st.subheader("財務比率")
+        st.dataframe(descending(ratio_df), use_container_width=True)
+        st.subheader("完整資產負債表（季末，單位：億元）")
+        st.dataframe(descending(balance_df), use_container_width=True)
+    
+    with tab3:
+        st.subheader("現金流量表分析")
+        st.plotly_chart(charts['cash'], use_container_width=True)
+        st.subheader("完整現金流量表（單季，單位：億元）")
+        st.dataframe(descending(cash_df), use_container_width=True)
+    
+    with tab4:
+        st.subheader("四階段財報分析")
+        show_fourstage_analysis(result['quality_report'], result['fscore_result'], result['zscore_result'],
+                                result['dupont_result'], result['cashflow_result'])
+    
+    with tab5:
+        st.subheader("AI 綜合財務分析")
+        if result['ai_analysis']:
+            st.markdown("### 🎯 AI 財務分析報告")
+            st.markdown(result['ai_analysis'])
+        else:
+            st.warning("請在側邊欄輸入 OpenAI API 金鑰以使用 AI 分析功能")
+            st.info("💡 AI分析功能需要OpenAI API金鑰，請在左側邊欄輸入後重新分析")
+        
+        st.markdown("### 📋 分析數據摘要")
+        if result['summary_rows']:
+            st.dataframe(pd.DataFrame(result['summary_rows']), use_container_width=True, hide_index=True)
+    
+    st.success(f"✅ 分析完成！（{result['generated_at']}）")
+
 def main():
     # 側邊欄
     st.sidebar.header("Code Gym", divider="rainbow")
-
-    # 登出按鈕
+    
+    # 登出按鈕（同時清除分析結果）
     if st.sidebar.button("🚪 登出"):
-        st.session_state["authenticated"] = False
+        st.session_state.clear()
         st.rerun()
-
+    
     ticker = st.sidebar.text_input(
         "輸入台股代碼（例如：2330 代表台積電）",
         "2330",
         help="請輸入四位數字的台股代碼，例如：2330、2454、2317、2412"
     ).strip()
-
+    
     finmind_api_token = st.sidebar.text_input(
         "輸入 FinMind API Token",
         type="password",
         value="",
         help="請前往 FinMind 官網（finmindtrade.com）註冊後，於使用者資訊頁取得 API Token"
     )
-
+    
     openai_api_key = st.sidebar.text_input(
         "輸入OpenAI API金鑰",
         type="password",
         value="",
         help="用於AI財務分析功能"
     )
-
+    
     ai_model = st.sidebar.selectbox(
         "AI 模型",
         AI_MODEL_OPTIONS,
         index=0,
         help="o4-mini 為規格指定模型；若帳戶無法使用，可改選 gpt-4o-mini"
     )
-
+    
     # 起始日期：預設為 5 年前（年對年比較至少需要 8 季、杜邦三年分析需要 12 季）
     default_start_date = datetime.now() - timedelta(days=5 * 365)
     start_date = st.sidebar.date_input(
@@ -1282,7 +1512,7 @@ def main():
         value=default_start_date,
         help="選擇財務數據的起始日期（預設為5年前，建議至少 3 年以上）"
     ).strftime('%Y-%m-%d')
-
+    
     # 免責聲明
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
@@ -1290,128 +1520,18 @@ def main():
     本系統僅供學術研究與教育用途，AI 提供的數據與分析結果僅供參考，**不構成投資建議或財務建議**。
     請使用者自行判斷投資決策，並承擔相關風險。本系統作者不對任何投資行為負責，亦不承擔任何損失責任。
     """)
-
-    if not st.sidebar.button("分析股票", type="primary"):
-        return
-
-    # 輸入驗證
-    is_valid, error_msg = validate_taiwan_stock_code(ticker)
-    if not is_valid:
-        st.error(error_msg)
-        return
-    if not finmind_api_token:
-        st.warning("請輸入 FinMind API Token")
-        return
-
-    try:
-        # 取得與處理數據
-        with st.spinner(f"正在從 FinMind API 獲取 {ticker} 的財務報表資料..."):
-            raw_data = get_finmind_raw_data(ticker, finmind_api_token, start_date)
-            quarterly, conversion_notes = build_quarterly_data(raw_data)
-            annual_views = build_annual_views(quarterly, raw_data.get('key_metrics', []))
-
-        stock_info_data = raw_data.get('stock_info', [])
-        is_financial = is_financial_industry(stock_info_data)
-
-        # 基本資訊
-        company_name, industries, market = show_basic_info(
-            ticker, stock_info_data, raw_data.get('key_metrics', []), raw_data.get('stock_price', []), annual_views
-        )
-        if is_financial:
-            st.warning("⚠️ 此公司屬於金融保險業，財報結構與一般產業不同，F-Score 與 Z-Score 不適用，結果僅供參考。")
-
-        # 四階段分析（只計算一次，各頁籤共用）
-        quality_report = analyze_data_quality(quarterly, annual_views, conversion_notes, is_financial)
-        fscore_result = calculate_piotroski_fscore(annual_views)
-        zscore_result = calculate_altman_zscore(annual_views)
-        dupont_result = calculate_dupont_analysis(annual_views)
-        cashflow_result = calculate_cashflow_analysis(annual_views)
-
-        # 展示用資料與圖表（只產生一次）
-        income_df, balance_df, ratio_df, cash_df = build_display_tables(quarterly)
-        if income_df.empty:
-            st.error("無法獲取有效的財務數據")
-            return
-        charts = create_financial_charts(income_df, balance_df, cash_df)
-
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "損益表分析", "資產負債表分析", "現金流量表分析", "四階段財報分析", "AI分析"
-        ])
-
-        with tab1:
-            st.subheader("損益表分析")
-            st.plotly_chart(charts['income'], use_container_width=True)
-            st.subheader("完整損益表（單季，單位：億元）")
-            st.dataframe(descending(income_df), use_container_width=True)
-
-        with tab2:
-            st.subheader("資產負債表分析")
-            st.plotly_chart(charts['balance'], use_container_width=True)
-            st.subheader("財務比率")
-            st.dataframe(descending(ratio_df), use_container_width=True)
-            st.subheader("完整資產負債表（季末，單位：億元）")
-            st.dataframe(descending(balance_df), use_container_width=True)
-
-        with tab3:
-            st.subheader("現金流量表分析")
-            st.plotly_chart(charts['cash'], use_container_width=True)
-            st.subheader("完整現金流量表（單季，單位：億元）")
-            st.dataframe(descending(cash_df), use_container_width=True)
-
-        with tab4:
-            st.subheader("四階段財報分析")
-            show_fourstage_analysis(quality_report, fscore_result, zscore_result, dupont_result, cashflow_result)
-
-        with tab5:
-            st.subheader("AI 綜合財務分析")
-            stock_info = {
-                'company_name': company_name,
-                'stock_code': ticker,
-                'industry': '、'.join(industries) if industries else 'N/A',
-                'market': market,
-                'is_financial_industry': is_financial,
-            }
-
-            if not openai_api_key:
-                st.warning("請在側邊欄輸入 OpenAI API 金鑰以使用 AI 分析功能")
-                st.info("💡 AI分析功能需要OpenAI API金鑰，請在左側邊欄輸入後重新分析")
-            else:
-                with st.spinner("正在使用AI進行四階段財務分析..."):
-                    ai_analysis = analyze_with_openai(
-                        annual_views, fscore_result, zscore_result, dupont_result, cashflow_result,
-                        quality_report, stock_info, openai_api_key, ai_model
-                    )
-                st.markdown("### 🎯 AI 財務分析報告")
-                st.markdown(ai_analysis)
-
-            # 分析數據摘要
-            st.markdown("### 📋 分析數據摘要")
-            summary_data = []
-            if fscore_result:
-                score = fscore_result['total_score']
-                summary_data.append({'分析項目': 'Piotroski F-Score', '結果': f"{score}/9",
-                                     '狀態': '優秀' if score >= 7 else '良好' if score >= 5 else '需關注'})
-            if zscore_result:
-                z = zscore_result['z_score']
-                summary_data.append({'分析項目': 'Altman Z-Score', '結果': 'N/A' if z is None else f"{z:.2f}",
-                                     '狀態': zscore_result['risk_level']})
-            if dupont_result['annual_data']:
-                roe = dupont_result['annual_data'][0]['direct_roe']
-                status = 'N/A' if roe is None else '優秀' if roe > 0.15 else '良好' if roe > 0.10 else '需關注'
-                summary_data.append({'分析項目': 'ROE (杜邦分析，近四季)', '結果': format_percent(roe), '狀態': status})
-            if cashflow_result:
-                summary_data.append({'分析項目': '現金流品質', '結果': format_ratio(cashflow_result['cf_quality_ratio'], 2),
-                                     '狀態': cashflow_result['quality_assessment']})
-            if summary_data:
-                st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
-
-        st.success("✅ 分析完成！")
-
-    except Exception as e:
-        st.error(f"分析過程中發生錯誤：{str(e)}")
-        st.info("請確認股票代碼與 FinMind API Token 是否正確，或稍後再試。")
-        # 詳細錯誤只寫入伺服器記錄（Streamlit Cloud 的 Manage app → Logs），不顯示在公開網頁上
-        print(traceback.format_exc())
+    
+    if st.sidebar.button("分析股票", type="primary"):
+        result = run_analysis(ticker, finmind_api_token, openai_api_key, ai_model, start_date)
+        if result:
+            st.session_state['analysis_result'] = result
+        else:
+            # 分析失敗時清除舊結果，避免誤以為是本次的分析
+            st.session_state.pop('analysis_result', None)
+    
+    result = st.session_state.get('analysis_result')
+    if result:
+        display_results(result)
 
 if __name__ == "__main__":
     main()
