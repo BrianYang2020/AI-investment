@@ -7,6 +7,7 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 import json
 import numpy as np
+import hmac
 
 # 設置頁面配置
 st.set_page_config(
@@ -15,6 +16,52 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+def check_password():
+    """
+    登入密碼驗證
+
+    密碼存放於 Streamlit Secrets 的 APP_PASSWORD：
+    - 本機：寫在 .streamlit/secrets.toml（勿上傳 GitHub）
+    - Streamlit Cloud：App settings → Secrets
+
+    Returns:
+        bool: 是否已通過驗證
+    """
+    # 已登入則直接通過
+    if st.session_state.get("authenticated"):
+        return True
+
+    # 讀取設定的密碼；未設定時一律拒絕進入，避免網頁在沒有保護的情況下公開
+    try:
+        app_password = str(st.secrets["APP_PASSWORD"])
+    except Exception:
+        app_password = ""
+
+    st.title("🔒 AI 股票趨勢分析系統")
+
+    if not app_password:
+        st.error("尚未設定登入密碼。請在 .streamlit/secrets.toml（本機）或 Streamlit Cloud 的 Secrets 中加入：APP_PASSWORD = \"您的密碼\"")
+        return False
+
+    # 使用表單，按 Enter 即可送出
+    with st.form("login_form"):
+        password = st.text_input("請輸入登入密碼", type="password")
+        submitted = st.form_submit_button("登入", type="primary")
+
+    if submitted:
+        # 使用 hmac.compare_digest 比對，避免時間差攻擊
+        if hmac.compare_digest(password.encode("utf-8"), app_password.encode("utf-8")):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("密碼錯誤，請重新輸入。")
+
+    return False
+
+# 未通過密碼驗證則停止執行後續內容
+if not check_password():
+    st.stop()
 
 # 主標題
 st.title("📈 AI 股票趨勢分析系統")
@@ -508,6 +555,12 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 
 # 側邊欄設置
 st.sidebar.markdown("## 🔧 分析設定")
+
+# 登出按鈕
+if st.sidebar.button("🚪 登出"):
+    st.session_state["authenticated"] = False
+    st.rerun()
+
 st.sidebar.divider()
 
 # 輸入控制項
